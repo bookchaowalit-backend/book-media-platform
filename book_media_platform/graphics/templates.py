@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from .errors import GraphicsError
 from .inputs import variant_dimensions
 from .models import (
-    BrandTokens,
     Canvas,
     GraphicIR,
     GraphicJob,
@@ -195,7 +194,7 @@ def compile_graphic(job: GraphicJob, record: Mapping[str, str], variant: str) ->
             nodes.append(title)
         description = _text(
             record, "description", node_id="product-description", x=margin + width * 0.04, y=height * 0.81,
-            width=width * 0.70, height=height * 0.075, color=colors["foreground"],
+            width=width * 0.66, height=height * 0.075, color=colors["foreground"],
             max_font_size=28, min_font_size=18, max_lines=2,
         )
         if description:

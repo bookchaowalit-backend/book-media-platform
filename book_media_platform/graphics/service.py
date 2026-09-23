@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import errno
+import hashlib
 import json
 import os
 import shutil
@@ -12,15 +12,14 @@ from typing import Any
 
 from .errors import ArtifactIntegrityError, GraphicsError
 from .fonts import find_font_file
-from .inputs import load_job
+from .inputs import load_job, variant_dimensions
 from .models import Artifact, BatchResult, GraphicJob
 from .qa import inspect_png, validate_svg
 from .renderer import EdgeRenderer, RendererProtocol
 from .svg import compile_svg
 from .templates import compile_graphic
 
-
-RECIPE_VERSION = "graphics-template-batch.v1.1"
+RECIPE_VERSION = "graphics-template-batch.v1.2"
 MANIFEST_SCHEMA = "graphics.artifact-manifest.v1"
 LOCK_TIMEOUT_SECONDS = 15
 COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
@@ -80,7 +79,7 @@ class _JobLock:
         self.path = path
         self.fd: int | None = None
 
-    def __enter__(self) -> "_JobLock":
+    def __enter__(self) -> _JobLock:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
         while True:
             try:
@@ -116,7 +115,13 @@ def _safe_artifact_path(root: Path, relative: str) -> Path:
     return resolved
 
 
-def _replay_result(target: Path, fingerprint: str) -> BatchResult:
+def _replay_result(
+    target: Path,
+    fingerprint: str,
+    job: GraphicJob,
+    renderer: RendererProtocol,
+    started_wall: float,
+) -> BatchResult:
     manifest_path = target / "manifest.json"
     if target.is_symlink() or not manifest_path.is_file():
         raise ArtifactIntegrityError("an output directory exists without a valid manifest")
@@ -128,6 +133,16 @@ def _replay_result(target: Path, fingerprint: str) -> BatchResult:
         raise ArtifactIntegrityError("existing artifact manifest root is invalid")
     if manifest.get("schema_version") != MANIFEST_SCHEMA or manifest.get("input_sha256") != fingerprint:
         raise GraphicsError("job id already exists with different inputs or renderer version")
+    if manifest.get("job_id") != job.job_id:
+        raise ArtifactIntegrityError("existing manifest job id does not match the requested job")
+    if manifest.get("status") != "accepted":
+        raise ArtifactIntegrityError("existing manifest is not an accepted result")
+    recipe = manifest.get("recipe")
+    if not isinstance(recipe, dict) or recipe != {"id": job.template, "version": RECIPE_VERSION}:
+        raise ArtifactIntegrityError("existing manifest recipe does not match the requested job")
+    renderer_info = manifest.get("renderer")
+    if not isinstance(renderer_info, dict) or renderer_info != {"name": renderer.name, "version": renderer.version}:
+        raise ArtifactIntegrityError("existing manifest renderer does not match the requested renderer")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise ArtifactIntegrityError("existing manifest has no artifact list")
@@ -135,7 +150,14 @@ def _replay_result(target: Path, fingerprint: str) -> BatchResult:
     if not isinstance(summary, dict):
         raise ArtifactIntegrityError("existing manifest summary is invalid")
     count = summary.get("accepted_outputs")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1 or len(artifacts) != count * 2:
+    expected_pairs = {(record["id"], variant) for record in job.records for variant in job.variants}
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(expected_pairs)
+        or len(artifacts) != count * 2
+        or summary.get("accepted_records") != len(job.records)
+    ):
         raise ArtifactIntegrityError("existing manifest has an invalid artifact count")
     artifact_pairs: dict[tuple[str, str], set[str]] = {}
     for item in artifacts:
@@ -152,19 +174,29 @@ def _replay_result(target: Path, fingerprint: str) -> BatchResult:
         expected_name = "design.svg" if role == "editable-svg" else "preview.png"
         if item["path"] != f"{record_id}/{variant}/{expected_name}":
             raise ArtifactIntegrityError("existing manifest artifact path does not match its identity")
+        if pair not in expected_pairs:
+            raise ArtifactIntegrityError("existing manifest contains an output that was not requested")
         path = _safe_artifact_path(target, item["path"])
         try:
-            digest = _hash(path.read_bytes())
+            data = path.read_bytes()
         except OSError as exc:
             raise ArtifactIntegrityError("an artifact listed in the manifest is missing") from exc
+        digest = _hash(data)
         if digest != item.get("sha256"):
             raise ArtifactIntegrityError("an artifact hash does not match its manifest")
-    if len(artifact_pairs) != count or any(roles != {"editable-svg", "preview-png"} for roles in artifact_pairs.values()):
+        if item.get("bytes") != len(data):
+            raise ArtifactIntegrityError("an artifact byte count does not match its manifest")
+        width, height = variant_dimensions(variant)
+        if item.get("width") != width or item.get("height") != height:
+            raise ArtifactIntegrityError("an artifact dimension does not match its selected variant")
+    if set(artifact_pairs) != expected_pairs or any(
+        roles != {"editable-svg", "preview-png"} for roles in artifact_pairs.values()
+    ):
         raise ArtifactIntegrityError("existing manifest output pairs are incomplete")
-    job_id = manifest.get("job_id")
-    if not isinstance(job_id, str):
-        raise ArtifactIntegrityError("existing manifest job id is invalid")
-    return BatchResult("replay", job_id, count, 0, None, manifest_path, 0.0, 0.0)
+    return BatchResult(
+        "replay", job.job_id, count, 0, None, manifest_path, 0.0,
+        round(time.perf_counter() - started_wall, 6),
+    )
 
 
 def _artifact(path: Path, target: Path, record_id: str, variant: str, role: str, width: int, height: int) -> Artifact:
@@ -181,6 +213,14 @@ def _artifact(path: Path, target: Path, record_id: str, variant: str, role: str,
     )
 
 
+def _record_output_directory(staging: Path, record_id: str, variant: str) -> Path:
+    staging_root = staging.resolve()
+    directory = (staging / record_id / variant).resolve()
+    if not directory.is_relative_to(staging_root):
+        raise GraphicsError("record output path escapes the graphics staging directory")
+    return directory
+
+
 def render_batch(
     spec: str | Path | GraphicJob,
     output_root: str | Path,
@@ -188,7 +228,7 @@ def render_batch(
     renderer: RendererProtocol | None = None,
 ) -> BatchResult:
     job = load_job(spec)
-    selected_renderer = renderer or EdgeRenderer()
+    selected_renderer: RendererProtocol = renderer if renderer is not None else EdgeRenderer()
     fingerprint = _job_fingerprint(job, selected_renderer)
     raw_output_base = Path(output_root).expanduser()
     if raw_output_base.is_symlink():
@@ -210,7 +250,7 @@ def render_batch(
     start_cpu = time.process_time()
     with _JobLock(lock_root / f"{job.job_id}.lock"):
         if target.exists() or target.is_symlink():
-            return _replay_result(target, fingerprint)
+            return _replay_result(target, fingerprint, job, selected_renderer, start_wall)
 
         staging = output_base / f".{job.job_id}.{uuid.uuid4().hex}.staging"
         try:
@@ -224,7 +264,7 @@ def render_batch(
                 for variant in job.variants:
                     ir = compile_graphic(job, record, variant)
                     svg_data = compile_svg(ir, job)
-                    record_dir = staging / record["id"] / variant
+                    record_dir = _record_output_directory(staging, record["id"], variant)
                     record_dir.mkdir(parents=True, exist_ok=True)
                     svg_path = record_dir / "design.svg"
                     png_path = record_dir / "preview.png"

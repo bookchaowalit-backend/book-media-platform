@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from .benchmark import run_acceptance_benchmark
 from .errors import GraphicsError
@@ -35,6 +35,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "monetary_cost": result.monetary_cost,
                 "manifest": str(result.manifest_path),
                 "fresh_wall_seconds": result.fresh_wall_seconds,
+                "replay_wall_seconds": result.replay_wall_seconds,
             }
         else:
             payload = run_acceptance_benchmark(args.output)

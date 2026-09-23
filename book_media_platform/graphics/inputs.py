@@ -5,14 +5,14 @@ import hashlib
 import json
 import re
 import struct
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .errors import GraphicsError
 from .fonts import require_font
 from .models import BrandTokens, GraphicJob, RasterAsset
-from .qa import inspect_png
-
+from .qa import inspect_png, inspect_png_bytes
 
 SCHEMA_VERSION = "graphics.job.v1"
 TEMPLATES = {"quote-card", "product-card", "announcement"}
@@ -215,7 +215,7 @@ def _read_records(raw: Any, base: Path, template: str) -> list[dict[str, Any]]:
 
 def load_job(spec: str | Path | GraphicJob) -> GraphicJob:
     if isinstance(spec, GraphicJob):
-        return spec
+        return _snapshot_graphic_job(spec)
     try:
         spec_path = Path(spec).expanduser().resolve(strict=True)
     except OSError as exc:
@@ -318,6 +318,109 @@ def load_job(spec: str | Path | GraphicJob) -> GraphicJob:
         assets=assets,
         spec_path=spec_path,
     )
+
+
+def _snapshot_graphic_job(job: GraphicJob) -> GraphicJob:
+    """Copy and revalidate a pre-parsed job at the rendering trust boundary."""
+    try:
+        if not isinstance(job.job_id, str) or not _SLUG.fullmatch(job.job_id):
+            raise GraphicsError("job_id must be a lowercase slug")
+        if not isinstance(job.template, str) or job.template not in TEMPLATES:
+            raise GraphicsError(f"template must be one of: {', '.join(sorted(TEMPLATES))}")
+        if not isinstance(job.brand, BrandTokens) or not isinstance(job.brand.colors, Mapping):
+            raise GraphicsError("GraphicJob brand tokens are invalid")
+
+        colors = dict(job.brand.colors)
+        if set(colors) - _COLOR_KEYS or not {"primary", "accent", "background", "foreground"}.issubset(colors):
+            raise GraphicsError("brand.colors requires primary, accent, background, and foreground tokens")
+        colors.setdefault("surface", "#FFFFFF")
+        for key, value in colors.items():
+            if not isinstance(value, str) or not _COLOR.fullmatch(value):
+                raise GraphicsError(f"brand color {key} must be a six-digit hex color")
+        font_family = job.brand.font_family
+        if not isinstance(font_family, str) or not font_family.strip():
+            raise GraphicsError("brand.font_family must be a non-empty string")
+        font_family = font_family.strip()
+        require_font(font_family)
+
+        if not isinstance(job.variants, (tuple, list)) or not job.variants or len(job.variants) > 3:
+            raise GraphicsError("variants must contain one to three supported sizes")
+        variants = tuple(job.variants)
+        if any(not isinstance(variant, str) or variant not in VARIANTS for variant in variants):
+            raise GraphicsError(f"variants must be selected from: {', '.join(VARIANTS)}")
+        if len(set(variants)) != len(variants):
+            raise GraphicsError("variants must not contain duplicates")
+
+        if not isinstance(job.records, (tuple, list)) or not job.records or len(job.records) > MAX_RECORDS:
+            raise GraphicsError(f"records must contain 1..{MAX_RECORDS} rows")
+        records = tuple(
+            _clean_record(dict(record), job.template, index + 1)
+            for index, record in enumerate(job.records)
+            if isinstance(record, Mapping)
+        )
+        if len(records) != len(job.records):
+            raise GraphicsError("each record must be an object")
+        if len(records) * len(variants) > MAX_OUTPUTS:
+            raise GraphicsError(f"job may create at most {MAX_OUTPUTS} outputs")
+        ids = [record["id"] for record in records]
+        if len(ids) != len(set(ids)):
+            raise GraphicsError("record ids must be unique within the job")
+
+        if not isinstance(job.assets, Mapping) or len(job.assets) > MAX_ASSETS:
+            raise GraphicsError(f"job may reference at most {MAX_ASSETS} raster assets")
+        assets: dict[str, RasterAsset] = {}
+        total_asset_bytes = 0
+        for asset_id, asset in job.assets.items():
+            if not isinstance(asset_id, str) or not _SLUG.fullmatch(asset_id) or not isinstance(asset, RasterAsset):
+                raise GraphicsError("GraphicJob assets contain an invalid asset entry")
+            if asset.asset_id != asset_id or not isinstance(asset.data, bytes):
+                raise GraphicsError(f"GraphicJob asset identity is invalid: {asset_id}")
+            if len(asset.data) <= 0 or len(asset.data) > MAX_ASSET_BYTES:
+                raise GraphicsError(f"asset size is outside the 1..{MAX_ASSET_BYTES} byte limit: {asset_id}")
+            mime_type, width, height = _validate_png(asset.data, asset_id)
+            if mime_type:
+                inspect_png_bytes(asset.data, width, height)
+            else:
+                mime_type, width, height = _validate_jpeg(asset.data)
+            if not mime_type or width <= 0 or height <= 0:
+                raise GraphicsError(f"local asset is not a supported PNG or JPEG: {asset_id}")
+            if width > MAX_CANVAS_DIMENSION * 2 or height > MAX_CANVAS_DIMENSION * 2:
+                raise GraphicsError(f"asset dimensions exceed the local processing limit: {asset_id}")
+            digest = hashlib.sha256(asset.data).hexdigest()
+            if asset.mime_type != mime_type or asset.width != width or asset.height != height or asset.sha256 != digest:
+                raise GraphicsError(f"GraphicJob asset metadata does not match its content: {asset_id}")
+            total_asset_bytes += len(asset.data)
+            if total_asset_bytes > MAX_TOTAL_ASSET_BYTES:
+                raise GraphicsError(f"total local raster assets exceed the {MAX_TOTAL_ASSET_BYTES} byte limit")
+            assets[asset_id] = RasterAsset(
+                asset_id=asset_id,
+                path=Path(asset.path),
+                mime_type=mime_type,
+                sha256=digest,
+                data=asset.data,
+                width=width,
+                height=height,
+            )
+        if job.template == "product-card":
+            for record in records:
+                if record["image_asset"] not in assets:
+                    raise GraphicsError(f"record {record['id']} references a missing local image asset")
+
+        if not isinstance(job.spec_path, (str, Path)):
+            raise GraphicsError("GraphicJob specification path is invalid")
+        return GraphicJob(
+            job_id=job.job_id,
+            template=job.template,
+            brand=BrandTokens(colors=colors, font_family=font_family),
+            variants=variants,
+            records=records,
+            assets=assets,
+            spec_path=Path(job.spec_path).expanduser().resolve(),
+        )
+    except GraphicsError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise GraphicsError("pre-parsed GraphicJob is malformed or no longer valid") from exc
 
 
 def variant_dimensions(name: str) -> tuple[int, int]:

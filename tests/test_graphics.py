@@ -7,8 +7,8 @@ import os
 import struct
 import tempfile
 import unittest
-import zlib
 import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,6 +101,7 @@ class GraphicsContractTests(unittest.TestCase):
         manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["usage"]["model_calls"], 0)
         self.assertIsNone(manifest["usage"]["monetary_cost"])
+        self.assertEqual(manifest["recipe"]["version"], "graphics-template-batch.v1.2")
         self.assertEqual(len(manifest["artifacts"]), 6)
         svg = next(result.manifest_path.parent.rglob("design.svg")).read_text(encoding="utf-8")
         self.assertIn("ระบบที่ดีใช้ logic กับงานที่รู้คำตอบอยู่แล้ว", svg)
@@ -127,6 +128,27 @@ class GraphicsContractTests(unittest.TestCase):
         self.assertEqual(len(job.records), 1)
         self.assertEqual(job.records[0]["quote"], "ข้อความจาก CSV")
         self.assertEqual(result.output_count, 3)
+
+    def test_render_revalidates_mutated_record_ids_before_using_them_as_paths(self) -> None:
+        job = load_job(self.write_spec(variants=["square"]))
+        job.records[0]["id"] = "../escaped"
+
+        with self.assertRaises(GraphicsError):
+            render_batch(job, self.output, renderer=FakeRenderer())
+
+        self.assertFalse((self.output / "escaped").exists())
+        self.assertFalse((self.output / job.job_id).exists())
+
+    def test_render_revalidates_mutated_brand_colors_before_svg_compilation(self) -> None:
+        job = load_job(self.write_spec(variants=["square"]))
+        job.brand.colors["primary"] = '#123456" onload="alert(1)'
+        renderer = FakeRenderer()
+
+        with self.assertRaises(GraphicsError):
+            render_batch(job, self.output, renderer=renderer)
+
+        self.assertFalse(hasattr(renderer, "last_svg"))
+        self.assertFalse((self.output / job.job_id).exists())
 
     def test_asset_is_embedded_as_data_and_never_kept_as_external_reference(self) -> None:
         # A 1x1 transparent PNG is enough to exercise the local-asset contract.
@@ -255,6 +277,7 @@ class GraphicsContractTests(unittest.TestCase):
         self.assertEqual(first.status, "accepted")
         self.assertEqual(replay.status, "replay")
         self.assertEqual(replay.output_count, first.output_count)
+        self.assertGreater(replay.replay_wall_seconds, 0)
 
         preview = next(first.manifest_path.parent.rglob("preview.png"))
         preview.write_bytes(preview.read_bytes() + b"tampered")
@@ -262,6 +285,47 @@ class GraphicsContractTests(unittest.TestCase):
             render_batch(spec_path, self.output, renderer=FakeRenderer())
 
         first.manifest_path.write_text("[]", encoding="utf-8")
+        with self.assertRaises(ArtifactIntegrityError):
+            render_batch(spec_path, self.output, renderer=FakeRenderer())
+
+    def test_replay_rejects_manifest_job_identity_mismatch(self) -> None:
+        spec_path = self.write_spec(variants=["square"])
+        first = render_batch(spec_path, self.output, renderer=FakeRenderer())
+        manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+        manifest["job_id"] = "different-job"
+        first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with self.assertRaises(ArtifactIntegrityError):
+            render_batch(spec_path, self.output, renderer=FakeRenderer())
+
+    def test_replay_rejects_manifest_recipe_and_renderer_mismatch(self) -> None:
+        for name, section, key, value in (
+            ("recipe", "recipe", "version", "graphics-template-batch.invalid"),
+            ("renderer", "renderer", "version", "different-renderer"),
+        ):
+            with self.subTest(name=name):
+                spec_path = self.write_spec(job_id=f"manifest-{name}", variants=["square"])
+                output = self.root / f"output-{name}"
+                first = render_batch(spec_path, output, renderer=FakeRenderer())
+                manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+                manifest[section][key] = value
+                first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                with self.assertRaises(ArtifactIntegrityError):
+                    render_batch(spec_path, output, renderer=FakeRenderer())
+
+    def test_replay_rejects_artifact_pairs_that_do_not_match_the_job(self) -> None:
+        spec_path = self.write_spec(variants=["square"])
+        first = render_batch(spec_path, self.output, renderer=FakeRenderer())
+        manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+        for artifact in manifest["artifacts"]:
+            artifact["record_id"] = "other-card"
+            artifact["path"] = artifact["path"].replace("first-card/", "other-card/")
+        original_dir = first.manifest_path.parent / "first-card"
+        moved_dir = first.manifest_path.parent / "other-card"
+        original_dir.rename(moved_dir)
+        first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
         with self.assertRaises(ArtifactIntegrityError):
             render_batch(spec_path, self.output, renderer=FakeRenderer())
 

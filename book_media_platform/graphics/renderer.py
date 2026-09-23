@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Protocol
+
 from .errors import GraphicsError
 
 
@@ -32,7 +34,7 @@ def find_edge() -> Path:
 
 def _edge_version(executable: Path) -> str:
     try:
-        import winreg  # type: ignore[import-not-found]
+        import winreg
 
         for key_name in (r"Software\Microsoft\Edge\BLBeacon", r"Software\WOW6432Node\Microsoft\Edge\BLBeacon"):
             try:
@@ -83,43 +85,104 @@ def _run_edge(
     def ps_literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
+    def stop_profiled_edge_processes() -> None:
+        cleanup_script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            f"$profile={ps_literal(str(profile_path.resolve()))}; "
+            "$matching=@(Get-CimInstance -ClassName Win32_Process -Filter \"Name='msedge.exe'\" "
+            "| Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }); "
+            "foreach ($item in $matching) { Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        cleanup_encoded = base64.b64encode(cleanup_script.encode("utf-16le")).decode("ascii")
+        try:
+            subprocess.run(
+                [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", cleanup_encoded],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$complete=$false; $lastLength=-1; $stable=0; $remaining=@(); $edge_exit=1; "
         f"$edge={ps_literal(args[0])}; "
         f"$arguments={ps_literal(arguments)}; "
         f"$preview={ps_literal(str(screenshot_path.resolve()))}; "
         f"$profile={ps_literal(str(profile_path.resolve()))}; "
+        "function Get-SessionEdge { @(Get-CimInstance -ClassName Win32_Process -Filter \"Name='msedge.exe'\" "
+        "| Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }) }; "
+        "try { "
         "$process=Start-Process -FilePath $edge -ArgumentList $arguments "
-        "-WindowStyle Hidden -PassThru -Wait; "
-        "$deadline=[DateTime]::UtcNow.AddSeconds(45); $lastLength=-1; $stable=0; "
+        "-WindowStyle Hidden -PassThru -Wait; $edge_exit=$process.ExitCode; "
+        "$deadline=[DateTime]::UtcNow.AddSeconds(45); "
         "while ([DateTime]::UtcNow -lt $deadline) { "
         "if (Test-Path -LiteralPath $preview) { "
         "$length=(Get-Item -LiteralPath $preview).Length; "
         "if ($length -ge 64 -and $length -eq $lastLength) { $stable++; if ($stable -ge 2) { break } } "
         "else { $stable=0 }; $lastLength=$length }; "
         "Start-Sleep -Milliseconds 50 }; "
-        "$complete=(Test-Path -LiteralPath $preview) -and ((Get-Item -LiteralPath $preview).Length -ge 64) -and ($stable -ge 2); "
-        "function Get-SessionEdge { @(Get-CimInstance -ClassName Win32_Process -Filter \"Name='msedge.exe'\" "
-        "| Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }) }; "
+        "$complete=(Test-Path -LiteralPath $preview) -and ((Get-Item -LiteralPath $preview).Length -ge 64) -and ($stable -ge 2) "
+        "} finally { "
         "$matching=Get-SessionEdge; foreach ($item in $matching) { "
         "Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue }; "
         "$cleanupDeadline=[DateTime]::UtcNow.AddSeconds(5); "
         "do { $remaining=Get-SessionEdge; if ($remaining.Count -eq 0) { break }; "
-        "Start-Sleep -Milliseconds 50 } while ([DateTime]::UtcNow -lt $cleanupDeadline); "
-        "$report=@{complete=$complete; bytes=$lastLength; edge_exit=$process.ExitCode; remaining=$remaining.Count}; "
+        "Start-Sleep -Milliseconds 50 } while ([DateTime]::UtcNow -lt $cleanupDeadline) }; "
+        "$report=@{complete=$complete; bytes=$lastLength; edge_exit=$edge_exit; remaining=$remaining.Count}; "
         "[Console]::Out.WriteLine('BOOK_MEDIA_GRAPHICS='+($report | ConvertTo-Json -Compress)); "
         "if (-not $complete -or $remaining.Count -gt 0) { exit 70 }; exit $process.ExitCode"
     )
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    return subprocess.run(
-        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        capture_output=True,
+    command = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout_seconds,
-        check=False,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+        tree_terminated = False
+        if taskkill:
+            try:
+                result = subprocess.run(
+                    [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    check=False,
+                )
+                tree_terminated = result.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not tree_terminated:
+            stop_profiled_edge_processes()
+            if process.poll() is None:
+                process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stop_profiled_edge_processes()
+            process.kill()
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout_seconds,
+            output=stdout or exc.output,
+            stderr=stderr or exc.stderr,
+        ) from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class EdgeRenderer:
@@ -185,9 +248,9 @@ class EdgeRenderer:
                 raise GraphicsError("could not move the rendered PNG into the output directory") from exc
 
 
-class RendererProtocol:
+class RendererProtocol(Protocol):
     name: str
     version: str
 
     def render(self, svg_path: Path, png_path: Path, width: int, height: int) -> None:
-        raise NotImplementedError
+        ...

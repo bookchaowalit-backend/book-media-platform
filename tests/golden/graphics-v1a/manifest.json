@@ -1,0 +1,23 @@
+{
+  "schema_version": "graphics.visual-golden.v1",
+  "recipe_version": "graphics-template-batch.v1.2",
+  "renderer": {
+    "name": "Microsoft Edge Headless",
+    "version": "153.0.4234.48"
+  },
+  "font": {
+    "family": "Arial",
+    "sha256": "b3658eadae55e682b5f69eb64c439c1ecc8f196c0bb8d4756d145d13bc86476a"
+  },
+  "images": {
+    "announcement-portrait": "d013965018903b887c88be9618e957c87c18d9103700bc51890a93587a49def7",
+    "announcement-square": "4438e8bc0c997ba6d7407cab4d055bacc9470f8e165386497e70eb8705eae77c",
+    "announcement-story": "000b90dc167c1c0d24626836bfbadde4d0b5f792a2a145038f5fd7906b03f53a",
+    "product-card-portrait": "37bcdfe1c62caa7e521225c2384081b77bb902d6248d5f10f849039c18f90bd7",
+    "product-card-square": "0b4e2bf768ad30c4315a984a7eca834714b0b59ccc3b40cdce728d96e295502f",
+    "product-card-story": "d8bb41d1dc0a866d25615ace5e3dc55dd45fee0c64400fbf17837a7e5b988e38",
+    "quote-card-portrait": "21c3cdb7bea5fb0d79ca6a6f7b25697290893bfbaee86c7983a2c1e1d9a67cbf",
+    "quote-card-square": "7cebe644153ff5cb41e99c692f06882a31189e3d6b01a276aef587c2e11553d8",
+    "quote-card-story": "544b01b300264fac083ce5c876dfa540dfcce83d61c07bc7bb5e2a7e7eb877c8"
+  }
+}

@@ -80,6 +80,19 @@ controller CPU time and wall time separately; browser child CPU is not included.
 Currency cost stays unknown without a rate card. The generated `.runtime`
 directory is local evidence and must not be committed.
 
+The reviewed visual golden set at `tests/golden/graphics-v1a/` covers all nine
+template/variant combinations with Thai copy and a local raster product image.
+Its SHA-256 baseline is tied to the recorded Edge version and Arial font hash;
+the integration test always checks output dimensions and only compares exact
+raster hashes when those renderer fingerprints match. Inspect all nine images
+before deliberately refreshing the baseline with
+`BOOK_MEDIA_GRAPHICS_UPDATE_GOLDENS=1` for
+`test_nine_visual_previews_match_reviewed_golden_images`.
+
+Product-card description and price boxes are separated by a fixed gap in every
+variant. A real Edge integration case covers long Thai product copy across all
+three sizes.
+
 ## Status boundary
 
 This is a local synthetic pilot. It does not expose a hosted API, accept

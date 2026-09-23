@@ -10,7 +10,6 @@ from pathlib import Path
 from .errors import GraphicsError
 from .models import GraphicIR, GraphicJob
 
-
 SVG_NS = "http://www.w3.org/2000/svg"
 _FORBIDDEN_TAGS = {"script", "foreignObject", "iframe", "object", "embed", "animate", "set"}
 
@@ -68,6 +67,10 @@ def validate_svg(svg_path: Path, ir: GraphicIR, job: GraphicJob, record: dict[st
 
 def inspect_png(path: Path, expected_width: int, expected_height: int) -> tuple[int, int, int]:
     data = path.read_bytes()
+    return inspect_png_bytes(data, expected_width, expected_height)
+
+
+def inspect_png_bytes(data: bytes, expected_width: int, expected_height: int) -> tuple[int, int, int]:
     if len(data) < 57 or len(data) > 80 * 1024 * 1024 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise GraphicsError("preview is missing a valid PNG container")
     index = 8
