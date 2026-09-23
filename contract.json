@@ -5,11 +5,11 @@
   "status": "scaffolded",
   "api_version": "v1",
   "data_owner": "book-media-platform",
-  "capabilities": ["platform-api", "health", "contract"],
+  "capabilities": ["platform-api", "health", "contract", "graphics-template-batch"],
   "depends_on": [],
   "current_implementation": {
-    "repository": "solo-empire",
-    "source_path": "none"
+    "repository": "book-media-platform",
+    "source_path": "book_media_platform/graphics"
   },
   "migration": {
     "compatibility_adapter": "required",

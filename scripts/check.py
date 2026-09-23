@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline contract and repository-shape check for a Book Platform scaffold."""
+"""Offline contract, product package and test check for Book Media Platform."""
 
 from __future__ import annotations
 
@@ -63,8 +63,16 @@ def main() -> int:
         ):
             fail(f"{key} must be a list of non-empty strings")
     implementation = contract["current_implementation"]
-    if not isinstance(implementation, dict) or implementation.get("repository") != "solo-empire":
-        fail("current_implementation.repository must be solo-empire")
+    if not isinstance(implementation, dict):
+        fail("current_implementation must be an object")
+    implementation_repository = implementation.get("repository")
+    source_path = implementation.get("source_path")
+    if implementation_repository not in {"solo-empire", "book-media-platform"}:
+        fail("current_implementation.repository must identify the control plane or this platform")
+    if not isinstance(source_path, str) or not source_path.strip():
+        fail("current_implementation.source_path must be a non-empty string")
+    if implementation_repository == "book-media-platform" and not (ROOT / source_path).is_dir():
+        fail("current_implementation.source_path must identify the local product package")
     migration = contract["migration"]
     if not isinstance(migration, dict):
         fail("migration must be an object")
@@ -73,12 +81,17 @@ def main() -> int:
             fail(f"migration.{key} must be a non-empty string")
 
     readme = readme_path.read_text(encoding="utf-8")
-    for heading in ("## Scope", "## Boundary", "## Local verification", "## Migration gate"):
+    for heading in ("## Scope", "## Graphics V1A", "## Boundary", "## Local verification", "## Migration gate"):
         if heading not in readme:
             fail(f"README.md is missing {heading}")
     if "__" in readme or "__" in contract_path.read_text(encoding="utf-8"):
         fail("scaffold placeholder remains")
-    print(f"OK: {contract['repository']} ({contract['platform_id']}) scaffold contract")
+    if "graphics-template-batch" not in contract["capabilities"]:
+        fail("graphics-template-batch capability is missing from the platform contract")
+    graphics_package = ROOT / "book_media_platform" / "graphics"
+    if not (graphics_package / "service.py").is_file() or not (graphics_package / "cli.py").is_file():
+        fail("Graphics V1A package is incomplete")
+    print(f"OK: {contract['repository']} ({contract['platform_id']}) local product contract")
     return 0
 
 

@@ -1,0 +1,20 @@
+{
+  "schema_version": "graphics.job.v1",
+  "job_id": "thai-quote-set",
+  "template": "quote-card",
+  "brand": {
+    "colors": {
+      "primary": "#17324D",
+      "accent": "#F2A65A",
+      "background": "#F8F5EF",
+      "foreground": "#14212B",
+      "surface": "#FFFFFF"
+    },
+    "font_family": "Leelawadee UI"
+  },
+  "variants": ["square", "portrait", "story"],
+  "records_source": {
+    "format": "csv",
+    "path": "quote-cards.csv"
+  }
+}

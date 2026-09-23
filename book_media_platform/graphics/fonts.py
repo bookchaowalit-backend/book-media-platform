@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+import os
+import platform
+from pathlib import Path
+
+from .errors import GraphicsError
+
+
+FONT_FILES: dict[str, tuple[str, ...]] = {
+    "Arial": ("arial.ttf", "Arial.ttf", "ArialMT.ttf"),
+    "Tahoma": ("tahoma.ttf", "Tahoma.ttf"),
+    "Leelawadee UI": ("LeelawUI.ttf", "LeelawUI-Bold.ttf", "LeelawadeeUI.ttf"),
+    "DejaVu Sans": ("DejaVuSans.ttf",),
+}
+
+
+def _font_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    if os.name == "nt":
+        windows = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        roots.extend((windows / "Fonts", Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Windows/Fonts"))
+    elif platform.system() == "Darwin":
+        roots.extend((Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts"))
+    else:
+        roots.extend(
+            (
+                Path("/usr/share/fonts/truetype/msttcorefonts"),
+                Path("/usr/share/fonts/truetype/dejavu"),
+                Path("/usr/share/fonts/truetype/tlwg"),
+                Path("/usr/local/share/fonts"),
+                Path.home() / ".local/share/fonts",
+            )
+        )
+    return tuple(root for root in roots if root.is_dir())
+
+
+def find_font_file(family: str) -> Path | None:
+    allowed = FONT_FILES.get(family)
+    if allowed is None:
+        return None
+    candidates = {item.casefold() for item in allowed}
+    for root in _font_roots():
+        try:
+            for item in root.iterdir():
+                if item.is_file() and item.name.casefold() in candidates:
+                    return item
+        except OSError:
+            continue
+    return None
+
+
+def require_font(family: str) -> Path:
+    path = find_font_file(family)
+    if path is None:
+        if family not in FONT_FILES:
+            raise GraphicsError(f"unsupported font family: {family}")
+        raise GraphicsError(f"required local font is not installed: {family}")
+    return path
