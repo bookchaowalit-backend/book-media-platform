@@ -47,6 +47,8 @@ input cannot introduce scripts, links or external resources.
 
 The supported local font families are `Arial`, `Tahoma`, `Leelawadee UI`, and
 `DejaVu Sans`; a family is accepted only when its local font file is present.
+Set `BOOK_MEDIA_FONT_DIRS` to absolute directories (platform path separator)
+to search additional font folders before the operating-system defaults.
 Template layout and text-box dimensions are fixed in the recipe. V1A rejects
 unknown dimensions rather than accepting arbitrary canvas sizes.
 
