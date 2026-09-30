@@ -29,14 +29,16 @@ python -m book_media_platform.graphics build \
 
 The local renderer requires Microsoft Edge Headless and an installed supported
 font. Set `BOOK_MEDIA_EDGE_PATH` only when Edge is installed outside the normal
-search paths. The renderer runs without background networking and accepts
+search paths, and `BOOK_MEDIA_FONT_DIRS` (absolute directories separated by the
+platform path separator) when a supported font lives outside the operating
+system font folders. The renderer runs without background networking and accepts
 only generated SVG with embedded local raster assets.
 
 ## Boundary
 
 - Owner: `bookchaowalit-backend`
 - Repository: `book-media-platform`
-- Target remote: `https://github.com/bookchaowalit-backend/book-media-platform.git` (not created by the bootstrap)
+- Target remote: `https://github.com/bookchaowalit-backend/book-media-platform.git` (published; runtime not activated)
 - Contract: `book-platform.contract.v1`
 - Status: `scaffolded`
 - Data owner: the platform boundary identified in `contract.json`
@@ -54,8 +56,18 @@ Run from this repository:
 bash scripts/check.sh
 ```
 
-The check validates the contract and product suite. It does not claim
-deployment, provider connectivity, data migration, or production readiness.
+The check validates `contract.json` against
+[`schema/book-platform.contract.v1.schema.json`](schema/book-platform.contract.v1.schema.json),
+confirms that the README and
+[`docs/CONTRACT-SURFACE.md`](docs/CONTRACT-SURFACE.md) agree with the
+contract, and runs the product test suite. Contract tests use a stand-in font
+through `BOOK_MEDIA_FONT_DIRS`, so they do not depend on host fonts; renderer
+tests skip when Edge or Arial is unavailable. GitHub Actions runs the same
+command on every push and pull request (`.github/workflows/check.yml`).
+Planned work is tracked in [`docs/UPGRADE-PLAN.md`](docs/UPGRADE-PLAN.md).
+
+The check does not claim deployment, provider connectivity, data migration, or
+production readiness.
 
 ## Migration gate
 

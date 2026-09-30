@@ -1,20 +1,77 @@
 {
+  "$schema": "./schema/book-platform.contract.v1.schema.json",
   "schema_version": "book-platform.contract.v1",
   "platform_id": "media",
   "repository": "book-media-platform",
   "status": "scaffolded",
   "api_version": "v1",
   "data_owner": "book-media-platform",
-  "capabilities": ["platform-api", "health", "contract", "graphics-template-batch"],
-  "depends_on": [],
+  "capabilities": [
+    "signed-upload",
+    "file-metadata",
+    "object-storage",
+    "image-processing",
+    "graphics-template-batch"
+  ],
+  "depends_on": [
+    "identity",
+    "security",
+    "observability"
+  ],
   "current_implementation": {
     "repository": "book-media-platform",
-    "source_path": "book_media_platform/graphics"
+    "source_path": "book_media_platform/graphics",
+    "source_paths": [
+      "book_media_platform/graphics"
+    ],
+    "source_status": "implemented-in-this-repository"
   },
   "migration": {
     "compatibility_adapter": "required",
     "shadow_parity": "pending",
     "cutover": "pending",
     "rollback": "required"
-  }
+  },
+  "migration_gates": [
+    "content-type validation",
+    "access-control parity",
+    "retention policy"
+  ],
+  "surface_doc": "docs/CONTRACT-SURFACE.md",
+  "interfaces": [
+    {
+      "id": "media.cli.graphics-build",
+      "kind": "cli",
+      "direction": "provides",
+      "name": "python -m book_media_platform.graphics build --job <job.json> --output <dir>",
+      "status": "implemented",
+      "source": "book_media_platform/graphics/cli.py",
+      "contract": "graphics.job.v1"
+    },
+    {
+      "id": "media.cli.graphics-benchmark",
+      "kind": "cli",
+      "direction": "provides",
+      "name": "python -m book_media_platform.graphics benchmark --output <dir>",
+      "status": "implemented",
+      "source": "book_media_platform/graphics/benchmark.py"
+    },
+    {
+      "id": "media.object-store.artifact-manifest",
+      "kind": "object-store",
+      "direction": "provides",
+      "name": "<output>/<job_id>/manifest.json plus <record_id>/<variant>/design.svg and preview.png",
+      "status": "implemented",
+      "source": "book_media_platform/graphics/service.py",
+      "contract": "graphics.artifact-manifest.v1"
+    },
+    {
+      "id": "media.config.local-renderer",
+      "kind": "config",
+      "direction": "consumes",
+      "name": "BOOK_MEDIA_EDGE_PATH and BOOK_MEDIA_FONT_DIRS local renderer settings",
+      "status": "implemented",
+      "source": "book_media_platform/graphics/renderer.py"
+    }
+  ]
 }
