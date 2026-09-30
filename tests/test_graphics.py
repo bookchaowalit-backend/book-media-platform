@@ -123,6 +123,29 @@ class GraphicsContractTests(unittest.TestCase):
         for png_path in result.manifest_path.parent.rglob("preview.png"):
             self.assertEqual(png_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
+    def test_stale_lock_from_a_crashed_run_does_not_block_the_next_run(self) -> None:
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        spec_path = self.write_spec()
+        crashed = subprocess.Popen([sys.executable, "-c", "pass"])
+        crashed.wait()
+        locks = self.output / ".locks"
+        locks.mkdir(parents=True)
+        (locks / "thai-sample.lock").write_text(
+            json.dumps({"pid": crashed.pid, "host": socket.gethostname(), "created_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        started = time.monotonic()
+        result = render_batch(spec_path, self.output, renderer=FakeRenderer())
+
+        self.assertEqual(result.status, "accepted")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse((locks / "thai-sample.lock").exists())
+
     def test_csv_rows_can_feed_the_same_template_contract(self) -> None:
         rows = self.root / "rows.csv"
         rows.write_text(
