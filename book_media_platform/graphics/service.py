@@ -36,6 +36,9 @@ LOCK_HEARTBEAT_SECONDS = 30.0
 HEARTBEAT_STALE_AFTER_SECONDS = 10 * 60
 # How long an empty/unparseable lock may exist before it counts as abandoned.
 LOCK_WRITE_GRACE_SECONDS = 5
+# Reclaiming a stale lock happens under a short-lived "<lock>.reclaim" guard.
+# A guard older than this was left by a reclaimer that crashed mid-reclaim.
+RECLAIM_GUARD_STALE_SECONDS = 30.0
 COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
 
 
@@ -171,6 +174,16 @@ def _lock_is_stale(owner: dict[str, Any], mtime: float, now: float) -> bool:
     return not _pid_alive(pid)
 
 
+def _same_file(fd: int, path: Path) -> bool:
+    """True when ``path`` still names the file open as ``fd``."""
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(path)
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+
+
 class _JobLock:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -211,37 +224,95 @@ class _JobLock:
         )
         self._heartbeat.start()
 
+    def owns_lock(self) -> bool:
+        """True while the lock path is still the file this run created."""
+        return self.fd is not None and _same_file(self.fd, self.path)
+
+    def ensure_held(self) -> None:
+        """Fail the run if another run took the lock over (never commit then)."""
+        if not self.owns_lock():
+            raise GraphicsError("the graphics job lock was taken over by another run; output not committed")
+
+    def _acquire_reclaim_guard(self) -> Path | None:
+        """Create the reclaim guard with O_EXCL; None when another run holds it."""
+        guard = self.path.with_name(f"{self.path.name}.reclaim")
+        for _ in range(2):
+            try:
+                os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+                return guard
+            except FileExistsError:
+                try:
+                    age = time.time() - guard.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                if age <= RECLAIM_GUARD_STALE_SECONDS:
+                    return None
+                try:  # left behind by a reclaimer that crashed mid-reclaim
+                    guard.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return None
+            except OSError:
+                return None
+        return None
+
     def _break_if_stale(self) -> bool:
-        """Remove a stale lock. Returns True when the caller should retry at once."""
+        """Remove a stale lock. Returns True when the caller should retry at once.
+
+        Reclaimers are serialized by an O_EXCL guard and re-check the lock
+        under it, so a lock that another reclaimer already replaced with a
+        live one is never touched. The lock is then moved aside and compared
+        with what was judged stale; if a live owner released and recreated it
+        in that instant, it is linked back. Should even that restore lose a
+        race, the holder whose lock was moved notices through ``ensure_held``
+        before committing output, so two runs never both commit.
+        """
         observed = _read_lock(self.path)
         if observed is None:
             return True
         raw, owner, mtime = observed
         if not _lock_is_stale(owner, mtime, time.time()):
             return False
-        # Move the lock aside atomically, then confirm it is the one we judged
-        # stale; if another process replaced it in between, put it back.
-        tombstone = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.stale")
+        guard = self._acquire_reclaim_guard()
+        if guard is None:
+            return False  # another run is reclaiming; wait for its result
         try:
-            os.replace(self.path, tombstone)
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        try:
-            moved = tombstone.read_bytes()
-        except OSError:
-            moved = raw
-        if moved != raw:
+            current = _read_lock(self.path)
+            if current is None:
+                return True
+            if current[0] != raw or not _lock_is_stale(current[1], current[2], time.time()):
+                return True  # replaced since we looked: judge the new lock afresh
+            tombstone = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.stale")
             try:
-                os.link(tombstone, self.path)
+                os.replace(self.path, tombstone)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            try:
+                moved = tombstone.read_bytes()
+            except OSError:
+                moved = raw
+            if moved != raw:
+                try:
+                    os.link(tombstone, self.path)
+                except OSError:
+                    # Another run already created a new lock; the displaced
+                    # holder fails at ensure_held() instead of committing.
+                    pass
+            try:
+                tombstone.unlink(missing_ok=True)
             except OSError:
                 pass
-        try:
-            tombstone.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return moved == raw
+            return moved == raw
+        finally:
+            try:
+                guard.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def __enter__(self) -> _JobLock:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
@@ -265,9 +336,12 @@ class _JobLock:
         if self._heartbeat is not None:
             self._heartbeat.join()
             self._heartbeat = None
+        owned = self.owns_lock()
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        if not owned:
+            return  # never delete a lock that another run now holds
         try:
             self.path.unlink(missing_ok=True)
         except OSError:
@@ -420,7 +494,7 @@ def render_batch(
         raise GraphicsError("could not create the output lock directory") from exc
     start_wall = time.perf_counter()
     start_cpu = time.process_time()
-    with _JobLock(lock_root / f"{job.job_id}.lock"):
+    with _JobLock(lock_root / f"{job.job_id}.lock") as job_lock:
         if target.exists() or target.is_symlink():
             return _replay_result(target, fingerprint, job, selected_renderer, start_wall)
 
@@ -492,6 +566,7 @@ def render_batch(
             _atomic_json(staging / "manifest.json", manifest)
             if target.exists() or target.is_symlink():
                 raise GraphicsError("job output appeared during execution; retry to verify replay")
+            job_lock.ensure_held()
             _commit_output_directory(staging, target)
             return BatchResult(
                 "accepted", job.job_id, output_count, 0, None, target / "manifest.json",

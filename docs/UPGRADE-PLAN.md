@@ -58,6 +58,14 @@ file metadata, object storage and access policy are not implemented.
 - `tests/test_drift_checks.py` covers both checks offline. Verified against
   `solo-empire` `5b43c85` (no drift, no warnings) and
   `bookchaowalit-backend-core/scripts/check_platform_sync.py --require-pin`.
+- Review fix (lock reclaim race): with 3+ contenders the old steal-then-
+  restore could lose the restore to a third run, leaving two holders.
+  Reclaimers now serialise on an O_EXCL `<lock>.reclaim` guard (30 s crash
+  expiry) and re-check the lock under it; the holder checks by inode that the
+  lock is still its own before committing output (fails otherwise) and only
+  unlinks its own lock on exit. 5 new tests incl. an 8-thread contention
+  test and the exact third-run interleaving (fails on the old code);
+  `bash scripts/check.sh` 81 tests OK (6 renderer skips), ruff clean.
 
 ## Done in pass 1
 

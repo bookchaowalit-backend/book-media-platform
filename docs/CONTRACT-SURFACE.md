@@ -36,6 +36,10 @@ when an interface listed there is missing from this page.
   every 30 s, so long renders keep it; a lock whose pid is gone on this host
   is reclaimed at once, and one with no heartbeat for 10 minutes (for example
   a crash on another host sharing the output root) is reclaimed then.
+  Reclaimers are serialised by a short-lived `<job_id>.lock.reclaim` guard
+  (created with O_EXCL; cleared after 30 s if its creator crashed) and re-check
+  the lock under it. A run commits output only while the lock path is still
+  the file it created; otherwise it fails instead of committing.
 - The manifest records `input_sha256` (job, recipe
   `graphics-template-batch.v1.2`, font file hash, asset hashes and renderer
   version), per-artifact `sha256`, `bytes`, `width` and `height`, and
