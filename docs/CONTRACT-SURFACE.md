@@ -31,6 +31,11 @@ when an interface listed there is missing from this page.
   into `<output>/<job_id>` only when every output passes. Re-running an
   identical job verifies every artifact hash and returns `replay`; different
   inputs for an existing `job_id` are rejected.
+- Concurrent runs of one `job_id` are serialised by `<output>/.locks/<job_id>.lock`
+  (a later run waits up to 15 s, then fails). The holder refreshes the lock
+  every 30 s, so long renders keep it; a lock whose pid is gone on this host
+  is reclaimed at once, and one with no heartbeat for 10 minutes (for example
+  a crash on another host sharing the output root) is reclaimed then.
 - The manifest records `input_sha256` (job, recipe
   `graphics-template-batch.v1.2`, font file hash, asset hashes and renderer
   version), per-artifact `sha256`, `bytes`, `width` and `height`, and

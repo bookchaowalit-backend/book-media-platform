@@ -2,7 +2,8 @@
 
 ## Current state
 
-Score: 6.5/10 (6 after pass 1, 4 before). A crashed run no longer blocks later runs of the same job. Graphics V1A is a well-tested local CLI with atomic,
+Score: 7/10 (6.5 after pass 1, 4 originally). Job locks survive long runs
+and recover from crashes on any host. Graphics V1A is a well-tested local CLI with atomic,
 replayable output; the repository now has a schema-validated contract, a
 documented surface, CI, and host-independent contract tests. Signed upload,
 file metadata, object storage and access policy are not implemented.
@@ -16,9 +17,9 @@ file metadata, object storage and access policy are not implemented.
 
 ### P1
 
-- Job lock heartbeat: a run longer than `STALE_LOCK_MAX_AGE_SECONDS` (1 h)
-  can have its lock reclaimed. Refresh the lock mtime while rendering, or move
-  to an OS lock (`fcntl.flock` / `msvcrt.locking`) released on process exit.
+- Detect lock loss: if a holder is suspended for more than 10 minutes its
+  lock can be reclaimed; compare the lock file's inode with the held fd
+  before committing output and abort instead of racing the new holder.
 - Exercise the Windows `_pid_alive` path (`OpenProcess`/`GetExitCodeProcess`)
   in a Windows CI job; it is only verified by review.
 
@@ -34,7 +35,19 @@ file metadata, object storage and access policy are not implemented.
 - Content-type validation and retention-policy fixtures for the registry
   migration gates.
 
-## Done in this pass
+## Done in this pass (pass 2)
+
+- P1 done: job lock heartbeat. The holder refreshes the lock mtime every 30 s
+  from a daemon thread (via its own fd, so it never touches another run's
+  lock) and stops it on release. New locks carry `heartbeat_seconds`; they are
+  stale only after 10 minutes without a heartbeat, so renders longer than 1 h
+  keep their lock and a crash on another host is recovered in 10 minutes
+  instead of 1 h. Legacy locks keep the 1 h age rule.
+- 5 new tests in `tests/test_job_lock.py`; `bash scripts/check.sh` 58 tests OK
+  (6 renderer tests skipped), ruff clean. Behaviour documented in
+  `docs/CONTRACT-SURFACE.md`.
+
+## Done in pass 1
 
 - Fixed: the contract tests required a host-installed Arial font, so 14 of 22
   tests errored on Linux; they now use a stand-in font through the new
@@ -48,7 +61,7 @@ file metadata, object storage and access policy are not implemented.
   `tests/test_contract_check.py`, `.github/workflows/check.yml`, and
   `docs/CONTRACT-SURFACE.md`.
 
-## Done in this pass (pass 2)
+## Done in pass 1 (follow-up)
 
 - P0 fixed: stale job locks. `_JobLock` now writes `{pid, host, created_at}`
   and, when the lock exists, reclaims it if the pid is gone on this host, it

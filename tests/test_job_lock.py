@@ -91,5 +91,68 @@ class StaleJobLockTests(unittest.TestCase):
         self.assertEqual(list(self.lock_path.parent.iterdir()), [])
 
 
+class JobLockHeartbeatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.lock_path = Path(self.temp.name) / "job.lock"
+        self.patches = [
+            patch.object(service, "LOCK_TIMEOUT_SECONDS", 0.3),
+            patch.object(service, "LOCK_HEARTBEAT_SECONDS", 0.02),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in reversed(self.patches):
+            p.stop()
+        self.temp.cleanup()
+
+    def test_new_locks_advertise_a_heartbeat(self) -> None:
+        with _JobLock(self.lock_path):
+            owner = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        self.assertGreater(owner["heartbeat_seconds"], 0)
+
+    def test_heartbeat_keeps_a_long_run_from_being_reclaimed(self) -> None:
+        with _JobLock(self.lock_path):
+            # Simulate a run that started hours ago: backdate the lock.
+            long_ago = time.time() - service.STALE_LOCK_MAX_AGE_SECONDS - 3600
+            os.utime(self.lock_path, (long_ago, long_ago))
+            deadline = time.monotonic() + 2
+            while self.lock_path.stat().st_mtime < time.time() - 5 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreater(self.lock_path.stat().st_mtime, time.time() - 5, "heartbeat refreshed mtime")
+            owner = json.loads(self.lock_path.read_text(encoding="utf-8"))
+            owner["created_at"] = long_ago
+            self.assertFalse(_lock_is_stale(owner, self.lock_path.stat().st_mtime, time.time()))
+            with self.assertRaises(GraphicsError):
+                with _JobLock(self.lock_path):
+                    pass
+        self.assertFalse(self.lock_path.exists())
+
+    def test_heartbeat_thread_stops_on_release(self) -> None:
+        lock = _JobLock(self.lock_path)
+        with lock:
+            thread = lock._heartbeat
+            self.assertIsNotNone(thread)
+            self.assertTrue(thread.is_alive())
+        self.assertFalse(thread.is_alive())
+
+    def test_silent_heartbeat_lock_is_stale_from_another_host(self) -> None:
+        now = time.time()
+        owner = {"pid": 4242, "host": "some-other-host", "created_at": now, "heartbeat_seconds": 30}
+        self.assertFalse(_lock_is_stale(owner, now - 60, now))
+        self.assertTrue(_lock_is_stale(owner, now - service.HEARTBEAT_STALE_AFTER_SECONDS - 1, now))
+
+    def test_long_running_heartbeat_lock_from_another_host_is_respected(self) -> None:
+        now = time.time()
+        owner = {
+            "pid": 4242,
+            "host": "some-other-host",
+            "created_at": now - service.STALE_LOCK_MAX_AGE_SECONDS * 5,
+            "heartbeat_seconds": 30,
+        }
+        self.assertFalse(_lock_is_stale(owner, now - 10, now))
+
+
 if __name__ == "__main__":
     unittest.main()

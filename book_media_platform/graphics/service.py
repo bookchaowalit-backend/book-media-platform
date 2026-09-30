@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +27,13 @@ LOCK_TIMEOUT_SECONDS = 15
 # A lock older than this is treated as abandoned even if its pid looks alive
 # (pid reuse, or a lock written by another host on a shared output root).
 STALE_LOCK_MAX_AGE_SECONDS = 60 * 60
+# A live holder refreshes its lock's mtime this often, so runs of any length
+# keep their lock. Locks that carry "heartbeat_seconds" are judged by the time
+# since the last refresh instead of by their creation time.
+LOCK_HEARTBEAT_SECONDS = 30.0
+# Missing this many seconds of heartbeats marks a heartbeat lock abandoned
+# (for example a crash on another host, where the pid cannot be checked).
+HEARTBEAT_STALE_AFTER_SECONDS = 10 * 60
 # How long an empty/unparseable lock may exist before it counts as abandoned.
 LOCK_WRITE_GRACE_SECONDS = 5
 COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
@@ -134,17 +142,26 @@ def _read_lock(path: Path) -> tuple[bytes, dict[str, Any], float] | None:
 def _lock_is_stale(owner: dict[str, Any], mtime: float, now: float) -> bool:
     """Decide whether a lock was left behind by a process that no longer runs.
 
-    - Older than STALE_LOCK_MAX_AGE_SECONDS: stale (covers pid reuse and locks
-      written from another host on a shared output directory).
+    - Heartbeat locks (current format): stale when not refreshed for
+      HEARTBEAT_STALE_AFTER_SECONDS, however long the run has been going.
+    - Legacy locks without a heartbeat: stale when older than
+      STALE_LOCK_MAX_AGE_SECONDS (covers pid reuse and locks written from
+      another host on a shared output directory).
     - Unreadable/empty and older than LOCK_WRITE_GRACE_SECONDS: stale (the
       holder crashed between creating and writing the file).
     - Written on this host by a pid that no longer exists: stale.
     """
-    created = owner.get("created_at")
-    started = float(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else mtime
-    age = now - min(started, mtime)
-    if age > STALE_LOCK_MAX_AGE_SECONDS:
-        return True
+    heartbeat = owner.get("heartbeat_seconds")
+    if isinstance(heartbeat, (int, float)) and not isinstance(heartbeat, bool) and heartbeat > 0:
+        # The holder refreshes mtime while it runs: only silence counts.
+        if now - mtime > HEARTBEAT_STALE_AFTER_SECONDS:
+            return True
+    else:
+        created = owner.get("created_at")
+        started = float(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else mtime
+        age = now - min(started, mtime)
+        if age > STALE_LOCK_MAX_AGE_SECONDS:
+            return True
     pid = owner.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool):
         return now - mtime > LOCK_WRITE_GRACE_SECONDS
@@ -158,10 +175,41 @@ class _JobLock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.fd: int | None = None
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat: threading.Thread | None = None
 
     def _owner_record(self) -> bytes:
-        record = {"pid": os.getpid(), "host": socket.gethostname(), "created_at": time.time()}
+        record = {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "created_at": time.time(),
+            "heartbeat_seconds": LOCK_HEARTBEAT_SECONDS,
+        }
         return json.dumps(record, sort_keys=True).encode("utf-8")
+
+    def _touch(self) -> None:
+        fd = self.fd
+        try:
+            if fd is not None and os.utime in os.supports_fd:
+                # Touch our own open file, never a lock another run created.
+                os.utime(fd)
+            else:  # pragma: no cover - Windows has no fd-based utime
+                self.path.touch(exist_ok=True)
+        except OSError:
+            pass
+
+    def _beat(self, interval: float) -> None:
+        while not self._stop_heartbeat.wait(interval):
+            self._touch()
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat = threading.Thread(
+            target=self._beat,
+            args=(LOCK_HEARTBEAT_SECONDS,),
+            name=f"job-lock-heartbeat:{self.path.name}",
+            daemon=True,
+        )
+        self._heartbeat.start()
 
     def _break_if_stale(self) -> bool:
         """Remove a stale lock. Returns True when the caller should retry at once."""
@@ -201,6 +249,7 @@ class _JobLock:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.write(self.fd, self._owner_record())
+                self._start_heartbeat()
                 return self
             except FileExistsError:
                 if self._break_if_stale():
@@ -212,8 +261,13 @@ class _JobLock:
                 raise GraphicsError("could not reserve a graphics job lock") from exc
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._stop_heartbeat.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join()
+            self._heartbeat = None
         if self.fd is not None:
             os.close(self.fd)
+            self.fd = None
         try:
             self.path.unlink(missing_ok=True)
         except OSError:
