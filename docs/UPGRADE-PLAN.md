@@ -27,8 +27,9 @@ file metadata, object storage and access policy are not implemented.
   build and Arial fingerprint, or record why they stay local-only.
 - Add a JSON schema file for `graphics.job.v1` and `graphics.artifact-manifest.v1`
   and validate `examples/graphics/*.json` against it in tests.
-- Keep `schema/book-platform.contract.v1.schema.json` identical to
-  `bookchaowalit-backend-core/contracts/`.
+- Replace the vendored schema and its pin with a reusable workflow or tagged
+  package from `bookchaowalit-backend-core` once one exists (the pin check
+  already fails on drift).
 
 ### P2
 
@@ -46,6 +47,17 @@ file metadata, object storage and access policy are not implemented.
 - 5 new tests in `tests/test_job_lock.py`; `bash scripts/check.sh` 58 tests OK
   (6 renderer tests skipped), ruff clean. Behaviour documented in
   `docs/CONTRACT-SURFACE.md`.
+- Schema pin: `schema/book-platform.contract.v1.schema.json.sha256` pins the
+  canonical digest; `scripts/check_schema_pin.py` fails on drift (and, with
+  `--canonical`, compares with a local backend-core checkout). It runs in
+  `scripts/check.sh` and as its own CI step.
+- `scripts/check_registry_alignment.py --solo-empire PATH` compares the
+  contract with `repository-catalog/registries/platforms.yaml` (local,
+  read-only; not in CI). Interface sources that exist in this repository are
+  skipped instead of reported as missing solo-empire paths.
+- `tests/test_drift_checks.py` covers both checks offline. Verified against
+  `solo-empire` `5b43c85` (no drift, no warnings) and
+  `bookchaowalit-backend-core/scripts/check_platform_sync.py --require-pin`.
 
 ## Done in pass 1
 

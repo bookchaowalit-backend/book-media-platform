@@ -30,6 +30,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Verify vendored schema matches pinned canonical
+        run: python3 scripts/check_schema_pin.py
+
       - name: Run offline contract check and tests
         # Real Edge rendering depends on the reviewed Edge build and Arial font
         # fingerprint (see tests/golden); hosted runners have neither, so the
