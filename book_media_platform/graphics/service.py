@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import shutil
+import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -22,6 +24,21 @@ from .templates import compile_graphic
 RECIPE_VERSION = "graphics-template-batch.v1.2"
 MANIFEST_SCHEMA = "graphics.artifact-manifest.v1"
 LOCK_TIMEOUT_SECONDS = 15
+# A lock older than this is treated as abandoned even if its pid looks alive
+# (pid reuse, or a lock written by another host on a shared output root).
+STALE_LOCK_MAX_AGE_SECONDS = 60 * 60
+# A live holder refreshes its lock's mtime this often, so runs of any length
+# keep their lock. Locks that carry "heartbeat_seconds" are judged by the time
+# since the last refresh instead of by their creation time.
+LOCK_HEARTBEAT_SECONDS = 30.0
+# Missing this many seconds of heartbeats marks a heartbeat lock abandoned
+# (for example a crash on another host, where the pid cannot be checked).
+HEARTBEAT_STALE_AFTER_SECONDS = 10 * 60
+# How long an empty/unparseable lock may exist before it counts as abandoned.
+LOCK_WRITE_GRACE_SECONDS = 5
+# Reclaiming a stale lock happens under a short-lived "<lock>.reclaim" guard.
+# A guard older than this was left by a reclaimer that crashed mid-reclaim.
+RECLAIM_GUARD_STALE_SECONDS = 30.0
 COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
 
 
@@ -74,19 +91,240 @@ def _commit_output_directory(staging: Path, target: Path) -> None:
             time.sleep(COMMIT_RETRY_DELAYS[attempt])
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process with this pid exists on this host."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        # os.kill(pid, 0) would terminate the process on Windows; query it instead.
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: exists, not ours
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _read_lock(path: Path) -> tuple[bytes, dict[str, Any], float] | None:
+    """Return (raw bytes, parsed owner, mtime) or None when the lock is gone."""
+    try:
+        raw = path.read_bytes()
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    owner: dict[str, Any] = {}
+    text = raw.decode("utf-8", errors="replace").strip()
+    if text.isdigit():  # legacy format: the bare pid
+        owner = {"pid": int(text)}
+    elif text:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            owner = parsed
+    return raw, owner, mtime
+
+
+def _lock_is_stale(owner: dict[str, Any], mtime: float, now: float) -> bool:
+    """Decide whether a lock was left behind by a process that no longer runs.
+
+    - Heartbeat locks (current format): stale when not refreshed for
+      HEARTBEAT_STALE_AFTER_SECONDS, however long the run has been going.
+    - Legacy locks without a heartbeat: stale when older than
+      STALE_LOCK_MAX_AGE_SECONDS (covers pid reuse and locks written from
+      another host on a shared output directory).
+    - Unreadable/empty and older than LOCK_WRITE_GRACE_SECONDS: stale (the
+      holder crashed between creating and writing the file).
+    - Written on this host by a pid that no longer exists: stale.
+    """
+    heartbeat = owner.get("heartbeat_seconds")
+    if isinstance(heartbeat, (int, float)) and not isinstance(heartbeat, bool) and heartbeat > 0:
+        # The holder refreshes mtime while it runs: only silence counts.
+        if now - mtime > HEARTBEAT_STALE_AFTER_SECONDS:
+            return True
+    else:
+        created = owner.get("created_at")
+        started = float(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else mtime
+        age = now - min(started, mtime)
+        if age > STALE_LOCK_MAX_AGE_SECONDS:
+            return True
+    pid = owner.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return now - mtime > LOCK_WRITE_GRACE_SECONDS
+    host = owner.get("host")
+    if host is not None and host != socket.gethostname():
+        return False
+    return not _pid_alive(pid)
+
+
+def _same_file(fd: int, path: Path) -> bool:
+    """True when ``path`` still names the file open as ``fd``."""
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(path)
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+
+
 class _JobLock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.fd: int | None = None
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat: threading.Thread | None = None
+
+    def _owner_record(self) -> bytes:
+        record = {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "created_at": time.time(),
+            "heartbeat_seconds": LOCK_HEARTBEAT_SECONDS,
+        }
+        return json.dumps(record, sort_keys=True).encode("utf-8")
+
+    def _touch(self) -> None:
+        fd = self.fd
+        try:
+            if fd is not None and os.utime in os.supports_fd:
+                # Touch our own open file, never a lock another run created.
+                os.utime(fd)
+            else:  # pragma: no cover - Windows has no fd-based utime
+                self.path.touch(exist_ok=True)
+        except OSError:
+            pass
+
+    def _beat(self, interval: float) -> None:
+        while not self._stop_heartbeat.wait(interval):
+            self._touch()
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat = threading.Thread(
+            target=self._beat,
+            args=(LOCK_HEARTBEAT_SECONDS,),
+            name=f"job-lock-heartbeat:{self.path.name}",
+            daemon=True,
+        )
+        self._heartbeat.start()
+
+    def owns_lock(self) -> bool:
+        """True while the lock path is still the file this run created."""
+        return self.fd is not None and _same_file(self.fd, self.path)
+
+    def ensure_held(self) -> None:
+        """Fail the run if another run took the lock over (never commit then)."""
+        if not self.owns_lock():
+            raise GraphicsError("the graphics job lock was taken over by another run; output not committed")
+
+    def _acquire_reclaim_guard(self) -> Path | None:
+        """Create the reclaim guard with O_EXCL; None when another run holds it."""
+        guard = self.path.with_name(f"{self.path.name}.reclaim")
+        for _ in range(2):
+            try:
+                os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+                return guard
+            except FileExistsError:
+                try:
+                    age = time.time() - guard.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                if age <= RECLAIM_GUARD_STALE_SECONDS:
+                    return None
+                try:  # left behind by a reclaimer that crashed mid-reclaim
+                    guard.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return None
+            except OSError:
+                return None
+        return None
+
+    def _break_if_stale(self) -> bool:
+        """Remove a stale lock. Returns True when the caller should retry at once.
+
+        Reclaimers are serialized by an O_EXCL guard and re-check the lock
+        under it, so a lock that another reclaimer already replaced with a
+        live one is never touched. The lock is then moved aside and compared
+        with what was judged stale; if a live owner released and recreated it
+        in that instant, it is linked back. Should even that restore lose a
+        race, the holder whose lock was moved notices through ``ensure_held``
+        before committing output, so two runs never both commit.
+        """
+        observed = _read_lock(self.path)
+        if observed is None:
+            return True
+        raw, owner, mtime = observed
+        if not _lock_is_stale(owner, mtime, time.time()):
+            return False
+        guard = self._acquire_reclaim_guard()
+        if guard is None:
+            return False  # another run is reclaiming; wait for its result
+        try:
+            current = _read_lock(self.path)
+            if current is None:
+                return True
+            if current[0] != raw or not _lock_is_stale(current[1], current[2], time.time()):
+                return True  # replaced since we looked: judge the new lock afresh
+            tombstone = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.stale")
+            try:
+                os.replace(self.path, tombstone)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            try:
+                moved = tombstone.read_bytes()
+            except OSError:
+                moved = raw
+            if moved != raw:
+                try:
+                    os.link(tombstone, self.path)
+                except OSError:
+                    # Another run already created a new lock; the displaced
+                    # holder fails at ensure_held() instead of committing.
+                    pass
+            try:
+                tombstone.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return moved == raw
+        finally:
+            try:
+                guard.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def __enter__(self) -> _JobLock:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(self.fd, str(os.getpid()).encode("ascii"))
+                os.write(self.fd, self._owner_record())
+                self._start_heartbeat()
                 return self
             except FileExistsError:
+                if self._break_if_stale():
+                    continue
                 if time.monotonic() >= deadline:
                     raise GraphicsError("timed out waiting for the same graphics job to finish")
                 time.sleep(0.05)
@@ -94,8 +332,16 @@ class _JobLock:
                 raise GraphicsError("could not reserve a graphics job lock") from exc
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._stop_heartbeat.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join()
+            self._heartbeat = None
+        owned = self.owns_lock()
         if self.fd is not None:
             os.close(self.fd)
+            self.fd = None
+        if not owned:
+            return  # never delete a lock that another run now holds
         try:
             self.path.unlink(missing_ok=True)
         except OSError:
@@ -248,7 +494,7 @@ def render_batch(
         raise GraphicsError("could not create the output lock directory") from exc
     start_wall = time.perf_counter()
     start_cpu = time.process_time()
-    with _JobLock(lock_root / f"{job.job_id}.lock"):
+    with _JobLock(lock_root / f"{job.job_id}.lock") as job_lock:
         if target.exists() or target.is_symlink():
             return _replay_result(target, fingerprint, job, selected_renderer, start_wall)
 
@@ -320,6 +566,7 @@ def render_batch(
             _atomic_json(staging / "manifest.json", manifest)
             if target.exists() or target.is_symlink():
                 raise GraphicsError("job output appeared during execution; retry to verify replay")
+            job_lock.ensure_held()
             _commit_output_directory(staging, target)
             return BatchResult(
                 "accepted", job.job_id, output_count, 0, None, target / "manifest.json",

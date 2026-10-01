@@ -12,6 +12,7 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
+from book_media_platform.graphics import fonts
 from book_media_platform.graphics import (
     ArtifactIntegrityError,
     GraphicsError,
@@ -55,8 +56,16 @@ class GraphicsContractTests(unittest.TestCase):
         self.assets.mkdir()
         self.spec_path = self.root / "job.json"
         self.output = self.root / "output"
+        # Contract tests must not depend on host fonts: provide a local stand-in
+        # for the supported Arial file through the documented override.
+        fonts = self.root / "fonts"
+        fonts.mkdir()
+        (fonts / "Arial.ttf").write_bytes(b"contract-test-font")
+        self.font_env = patch.dict(os.environ, {"BOOK_MEDIA_FONT_DIRS": str(fonts)})
+        self.font_env.start()
 
     def tearDown(self) -> None:
+        self.font_env.stop()
         self.temp.cleanup()
 
     def write_spec(self, *, template: str = "quote-card", **overrides: object) -> Path:
@@ -113,6 +122,29 @@ class GraphicsContractTests(unittest.TestCase):
         self.assertEqual("".join(visible_text.itertext()), "ระบบที่ดีใช้ logic กับงานที่รู้คำตอบอยู่แล้ว")
         for png_path in result.manifest_path.parent.rglob("preview.png"):
             self.assertEqual(png_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_stale_lock_from_a_crashed_run_does_not_block_the_next_run(self) -> None:
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        spec_path = self.write_spec()
+        crashed = subprocess.Popen([sys.executable, "-c", "pass"])
+        crashed.wait()
+        locks = self.output / ".locks"
+        locks.mkdir(parents=True)
+        (locks / "thai-sample.lock").write_text(
+            json.dumps({"pid": crashed.pid, "host": socket.gethostname(), "created_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        started = time.monotonic()
+        result = render_batch(spec_path, self.output, renderer=FakeRenderer())
+
+        self.assertEqual(result.status, "accepted")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse((locks / "thai-sample.lock").exists())
 
     def test_csv_rows_can_feed_the_same_template_contract(self) -> None:
         rows = self.root / "rows.csv"
@@ -360,3 +392,36 @@ class GraphicsContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FontDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_configured_font_directory_is_searched_first_and_case_insensitively(self) -> None:
+        first = self.root / "first"
+        second = self.root / "second"
+        first.mkdir()
+        second.mkdir()
+        (second / "DEJAVUSANS.TTF").write_bytes(b"font")
+        value = os.pathsep.join([str(first), str(second)])
+        with patch.dict(os.environ, {fonts.FONT_DIRS_ENV: value}):
+            self.assertEqual(fonts.find_font_file("DejaVu Sans"), second / "DEJAVUSANS.TTF")
+            self.assertEqual(fonts.require_font("DejaVu Sans"), second / "DEJAVUSANS.TTF")
+
+    def test_relative_configured_font_directories_are_ignored(self) -> None:
+        with patch.dict(os.environ, {fonts.FONT_DIRS_ENV: os.pathsep.join(["relative-fonts", ""])}):
+            self.assertEqual(fonts._configured_font_roots(), [])
+
+    def test_unknown_family_and_missing_file_are_distinct_errors(self) -> None:
+        with patch.dict(os.environ, {fonts.FONT_DIRS_ENV: str(self.root)}), patch.object(
+            fonts, "_font_roots", return_value=(self.root,)
+        ):
+            with self.assertRaisesRegex(GraphicsError, "unsupported font family"):
+                fonts.require_font("Comic Sans")
+            with self.assertRaisesRegex(GraphicsError, "not installed: Tahoma"):
+                fonts.require_font("Tahoma")

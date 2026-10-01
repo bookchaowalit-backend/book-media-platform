@@ -48,7 +48,22 @@ def write_pattern_png(path: Path) -> None:
     )
 
 
+def _require_local_renderer(test: unittest.TestCase, *, font_family: str | None = "Arial") -> None:
+    """Skip real-renderer tests when Edge or the reviewed font is unavailable."""
+
+    try:
+        find_edge()
+    except GraphicsError as exc:
+        test.skipTest(str(exc))
+    if font_family is not None and find_font_file(font_family) is None:
+        test.skipTest(f"{font_family} font is not installed")
+
+
 class EdgeRendererIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if os.environ.get("BOOK_MEDIA_SKIP_RENDERER_TESTS") == "1":
+            self.skipTest("renderer integration tests disabled by BOOK_MEDIA_SKIP_RENDERER_TESTS=1")
+
     def test_nine_visual_previews_match_reviewed_golden_images(self) -> None:
         try:
             edge = EdgeRenderer(find_edge())
@@ -219,10 +234,7 @@ class EdgeRendererIntegrationTests(unittest.TestCase):
             self.assertEqual(inspect_png(png, 1080, 1080)[:2], (1080, 1080))
 
     def test_real_render_and_atomic_commit_work_under_deep_output_root(self) -> None:
-        try:
-            find_edge()
-        except GraphicsError as exc:
-            self.skipTest(str(exc))
+        _require_local_renderer(self)
         with tempfile.TemporaryDirectory(prefix="graphics deep output ") as temp_dir:
             root = Path(temp_dir)
             job = {
@@ -253,10 +265,7 @@ class EdgeRendererIntegrationTests(unittest.TestCase):
             self.assertTrue(result.manifest_path.is_file())
 
     def test_real_product_template_embeds_and_renders_local_png_asset(self) -> None:
-        try:
-            find_edge()
-        except GraphicsError as exc:
-            self.skipTest(str(exc))
+        _require_local_renderer(self)
         with tempfile.TemporaryDirectory(prefix="graphics product asset ") as temp_dir:
             root = Path(temp_dir)
             assets = root / "assets"
@@ -310,10 +319,7 @@ class EdgeRendererIntegrationTests(unittest.TestCase):
             self.assertEqual(inspect_png(preview, 1080, 1080)[:2], (1080, 1080))
 
     def test_long_product_description_stays_clear_of_price_in_all_variants(self) -> None:
-        try:
-            find_edge()
-        except GraphicsError as exc:
-            self.skipTest(str(exc))
+        _require_local_renderer(self)
         with tempfile.TemporaryDirectory(prefix="graphics product text spacing ") as temp_dir:
             root = Path(temp_dir)
             assets = root / "assets"
