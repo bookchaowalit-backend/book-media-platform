@@ -1,0 +1,8 @@
+system_id: bookchaowalit-backend/book-backend/book-media-platform
+prefix: CARD
+brand: "BOOK MEDIA PLATFORM"
+subtitle: "ผลิตกราฟิก SVG/PNG จากข้อมูลแบบ deterministic; รุ่นก่อนของ book-production-platform"
+footer: "Book Media Platform — Product Card"
+color: "#2f4b6e"
+audience: internal
+tier: L0
