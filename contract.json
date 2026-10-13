@@ -2,10 +2,10 @@
   "$schema": "./schema/book-platform.contract.v1.schema.json",
   "schema_version": "book-platform.contract.v1",
   "platform_id": "media",
-  "repository": "book-media-platform",
+  "repository": "platform-media",
   "status": "scaffolded",
   "api_version": "v1",
-  "data_owner": "book-media-platform",
+  "data_owner": "platform-media",
   "capabilities": [
     "signed-upload",
     "file-metadata",
@@ -19,7 +19,7 @@
     "observability"
   ],
   "current_implementation": {
-    "repository": "book-media-platform",
+    "repository": "platform-media",
     "source_path": "book_media_platform/graphics",
     "source_paths": [
       "book_media_platform/graphics"

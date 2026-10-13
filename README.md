@@ -1,4 +1,4 @@
-# book-media-platform
+# platform-media
 
 `Media` platform boundary for the Book Platform portfolio.
 
@@ -37,8 +37,8 @@ only generated SVG with embedded local raster assets.
 ## Boundary
 
 - Owner: `bookchaowalit-backend`
-- Repository: `book-media-platform`
-- Target remote: `https://github.com/bookchaowalit-backend/book-media-platform.git` (published; runtime not activated)
+- Repository: `platform-media`
+- Target remote: `https://github.com/bookchaowalit-backend/platform-media.git` (published; runtime not activated)
 - Contract: `book-platform.contract.v1`
 - Status: `scaffolded`
 - Data owner: the platform boundary identified in `contract.json`
