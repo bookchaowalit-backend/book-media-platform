@@ -34,9 +34,9 @@ jobs:
         run: python3 scripts/check_schema_pin.py
 
       - name: Run offline contract check and tests
-        # Real Edge rendering depends on the reviewed Edge build and Arial font
-        # fingerprint (see tests/golden); hosted runners have neither, so the
-        # renderer integration tests run locally only.
+        # Hosted browser discovery does not establish a working sandbox or the
+        # reviewed Edge/Arial fingerprints. The separate manual renderer gate
+        # requires every intended renderer case to execute without skips.
         env:
           BOOK_MEDIA_SKIP_RENDERER_TESTS: "1"
         run: bash scripts/check.sh
